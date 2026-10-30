@@ -1,0 +1,1036 @@
+<!doctype html>
+<!--
+  SplatXR — a tiny, dependency-free Gaussian splat viewer for WebXR headsets (Meta Quest 2/3/Pro) and desktop.
+  Loads .splat and standard 3DGS .ply files from preset links, any CORS-enabled URL, or a local file.
+
+  MIT License
+  Copyright (c) 2026 SplatXR contributors
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+  documentation files (the "Software"), to deal in the Software without restriction, including without limitation
+  the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+  permit persons to whom the Software is furnished to do so, subject to the following conditions:
+  The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+  the Software.
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+  THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+  TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+
+  Rendering approach follows the original 3D Gaussian Splatting paper (Kerbl et al. 2023) and the WebGL technique
+  popularised by antimatter15/splat (MIT). Written from scratch for WebXR stereo rendering.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>SplatXR — Gaussian splat viewer</title>
+<style>
+  :root {
+    --scene: #1c2130;
+    --panel: rgba(28, 33, 48, 0.86);
+    --panel-edge: rgba(190, 200, 255, 0.16);
+    --ink: #eef0fb;
+    --ink-soft: #a9afc6;
+    --accent: #9fb0ff;
+    --accent-ink: #141a33;
+    --danger: #ff9c8a;
+    --field: rgba(255, 255, 255, 0.07);
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; background: var(--scene); color: var(--ink);
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; overflow: hidden; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; cursor: grab; }
+  canvas:active { cursor: grabbing; }
+
+  #panel {
+    position: fixed; top: calc(12px + env(safe-area-inset-top, 0px)); left: 12px;
+    width: min(360px, calc(100vw - 24px)); max-height: calc(100% - 24px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
+    overflow-y: auto; background: var(--panel); border: 1px solid var(--panel-edge);
+    border-radius: 18px; padding: 16px 16px 14px; backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+  }
+  #panel.collapsed > :not(header) { display: none; }
+  header { display: flex; align-items: center; gap: 10px; }
+  h1 { font-size: 20px; letter-spacing: -0.01em; margin: 0; flex: 1; font-weight: 700; }
+  h1 small { font-weight: 400; color: var(--ink-soft); font-size: 13px; margin-left: 6px; }
+  h2 { font-size: 13px; font-weight: 600; color: var(--ink-soft); margin: 16px 0 8px; }
+
+  button, select, input[type=text] {
+    font: inherit; color: var(--ink); background: var(--field); border: 1px solid transparent;
+    border-radius: 10px; min-height: 44px; padding: 0 14px;
+  }
+  button { cursor: pointer; font-weight: 600; }
+  button:hover { background: rgba(255,255,255,0.12); }
+  button:focus-visible, select:focus-visible, input:focus-visible, label.file:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
+  #vrBtn {
+    width: 100%; min-height: 56px; margin-top: 14px; font-size: 17px;
+    background: var(--accent); color: var(--accent-ink); border-radius: 14px;
+  }
+  #vrBtn:hover { filter: brightness(1.08); }
+  #vrBtn:disabled { background: var(--field); color: var(--ink-soft); cursor: not-allowed; filter: none; }
+  #toggleBtn { min-height: 36px; padding: 0 10px; font-size: 13px; }
+
+  .presets { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .presets button { text-align: left; font-weight: 500; }
+  .presets button.active { border-color: var(--accent); color: #fff; }
+  .row { display: flex; gap: 6px; }
+  .row input[type=text] { flex: 1; min-width: 0; }
+  label.file { display: flex; align-items: center; justify-content: center; min-height: 44px; border-radius: 10px;
+    border: 1px dashed var(--panel-edge); color: var(--ink-soft); cursor: pointer; margin-top: 6px; }
+  label.file input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+  .opts { display: grid; gap: 8px; }
+  .check { display: flex; align-items: center; gap: 10px; min-height: 36px; cursor: pointer; }
+  .check input { width: 20px; height: 20px; accent-color: var(--accent); }
+  .opts select { width: 100%; }
+  .opt-line { display: flex; align-items: center; gap: 10px; }
+  .opt-line span { flex: 1; }
+  .opt-line select { width: auto; }
+
+  #status { margin-top: 12px; font-size: 13px; color: var(--ink-soft); min-height: 1.4em; }
+  #status.error { color: var(--danger); }
+  #bar { height: 4px; border-radius: 4px; background: var(--field); overflow: hidden; margin-top: 6px; visibility: hidden; }
+  #bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .15s; }
+
+  dl.keys { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin: 0; font-size: 13px; }
+  dl.keys dt { color: var(--ink); font-weight: 600; white-space: nowrap; }
+  dl.keys dd { margin: 0; color: var(--ink-soft); }
+  .note { font-size: 12.5px; color: var(--ink-soft); margin: 8px 0 0; }
+
+  #drop { position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
+    background: rgba(28,33,48,0.7); border: 3px dashed var(--accent); font-size: 22px; font-weight: 700; pointer-events: none; }
+  body.dragging #drop { display: flex; }
+  @media (prefers-reduced-motion: reduce) { #bar > i { transition: none; } }
+</style>
+</head>
+<body>
+<canvas id="c" aria-label="3D splat view. Drag to rotate, scroll to zoom."></canvas>
+
+<aside id="panel">
+  <header>
+    <h1>SplatXR<small>splat viewer</small></h1>
+    <button id="toggleBtn" aria-expanded="true">Hide</button>
+  </header>
+
+  <button id="vrBtn" disabled>Checking for VR…</button>
+
+  <h2>Sample splats</h2>
+  <div class="presets" id="presets"></div>
+
+  <h2>Open a splat</h2>
+  <div class="row">
+    <input type="text" id="urlInput" placeholder="https://…/scene.splat or .ply" inputmode="url" autocomplete="off" spellcheck="false">
+    <button id="urlBtn">Load</button>
+  </div>
+  <label class="file">Choose a file from this device<input type="file" id="fileInput" accept=".splat,.ply"></label>
+
+  <div id="status" role="status">Pick a sample to start.</div>
+  <div id="bar"><i></i></div>
+
+  <h2>View</h2>
+  <div class="opts">
+    <label class="check"><input type="checkbox" id="flipChk" checked> Flip upside-down</label>
+    <label class="check"><input type="checkbox" id="spinChk"> Spin slowly</label>
+    <label class="check"><input type="checkbox" id="gridChk" checked> Floor grid in VR</label>
+    <label class="opt-line"><span>Splat budget</span>
+      <select id="capSel">
+        <option value="250000">250k (fastest)</option>
+        <option value="500000">500k</option>
+        <option value="1000000">1 million</option>
+        <option value="2000000">2 million</option>
+        <option value="0">No limit</option>
+      </select>
+    </label>
+  </div>
+
+  <h2>In the headset</h2>
+  <dl class="keys">
+    <dt>Grip or trigger</dt><dd>Grab the splat to move and turn it</dd>
+    <dt>Both grips</dt><dd>Pull apart to scale, twist to rotate</dd>
+    <dt>Right stick</dt><dd>Left/right spins it, up/down resizes it</dd>
+    <dt>Left stick</dt><dd>Walk through the scene</dd>
+    <dt>A / B</dt><dd>Next sample / reset placement</dd>
+    <dt>X / Y</dt><dd>Flip upside-down / toggle spin</dd>
+  </dl>
+
+  <h2>On a screen</h2>
+  <dl class="keys">
+    <dt>Drag</dt><dd>Orbit around the splat</dd>
+    <dt>Right-drag or Shift</dt><dd>Pan</dd>
+    <dt>Scroll or pinch</dt><dd>Zoom</dd>
+    <dt>R / F / Space</dt><dd>Reset / flip / spin</dd>
+  </dl>
+  <p class="note">Links must allow cross-origin downloads (Hugging Face, GitHub raw and most CDNs do). Share a scene with <code>?url=</code> in the address.</p>
+</aside>
+<div id="drop">Drop a .splat or .ply file</div>
+
+<script>
+'use strict';
+/* ============================================================
+   Presets — public sample scenes hosted on Hugging Face
+   ============================================================ */
+const HF = 'https://huggingface.co/cakewalk/splat-data/resolve/main/';
+const PRESETS = [
+  { name: 'Plush toy', url: HF + 'plush.splat', flip: true },
+  { name: 'Sneaker',   url: HF + 'nike.splat',  flip: true },
+  { name: 'Train',     url: HF + 'train.splat', flip: true },
+  { name: 'Truck',     url: HF + 'truck.splat', flip: true },
+  { name: 'Garden (large)', url: HF + 'garden.splat', flip: true },
+  { name: 'Tree hill (large)', url: HF + 'treehill.splat', flip: true },
+];
+
+/* ============================================================
+   Small column-major 4x4 matrix library
+   ============================================================ */
+const M4 = {
+  ident() { const m = new Float32Array(16); m[0] = m[5] = m[10] = m[15] = 1; return m; },
+  mul(a, b) {
+    const o = new Float32Array(16);
+    for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+      o[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+    }
+    return o;
+  },
+  trans(x, y, z) { const m = M4.ident(); m[12] = x; m[13] = y; m[14] = z; return m; },
+  scale(x, y, z) { const m = M4.ident(); m[0] = x; m[5] = y; m[10] = z; return m; },
+  rotX(a) { const m = M4.ident(), c = Math.cos(a), s = Math.sin(a); m[5] = c; m[6] = s; m[9] = -s; m[10] = c; return m; },
+  rotY(a) { const m = M4.ident(), c = Math.cos(a), s = Math.sin(a); m[0] = c; m[2] = -s; m[8] = s; m[10] = c; return m; },
+  persp(fovy, aspect, n, f) {
+    const m = new Float32Array(16), t = 1 / Math.tan(fovy / 2);
+    m[0] = t / aspect; m[5] = t; m[10] = (f + n) / (n - f); m[11] = -1; m[14] = 2 * f * n / (n - f);
+    return m;
+  },
+  invert(a) {
+    const o = new Float32Array(16);
+    const a00=a[0],a01=a[1],a02=a[2],a03=a[3],a10=a[4],a11=a[5],a12=a[6],a13=a[7],
+          a20=a[8],a21=a[9],a22=a[10],a23=a[11],a30=a[12],a31=a[13],a32=a[14],a33=a[15];
+    const b00=a00*a11-a01*a10,b01=a00*a12-a02*a10,b02=a00*a13-a03*a10,b03=a01*a12-a02*a11,
+          b04=a01*a13-a03*a11,b05=a02*a13-a03*a12,b06=a20*a31-a21*a30,b07=a20*a32-a22*a30,
+          b08=a20*a33-a23*a30,b09=a21*a32-a22*a31,b10=a21*a33-a23*a31,b11=a22*a33-a23*a32;
+    let det = b00*b11-b01*b10+b02*b09+b03*b08-b04*b07+b05*b06;
+    if (!det) return M4.ident();
+    det = 1 / det;
+    o[0]=(a11*b11-a12*b10+a13*b09)*det; o[1]=(a02*b10-a01*b11-a03*b09)*det;
+    o[2]=(a31*b05-a32*b04+a33*b03)*det; o[3]=(a22*b04-a21*b05-a23*b03)*det;
+    o[4]=(a12*b08-a10*b11-a13*b07)*det; o[5]=(a00*b11-a02*b08+a03*b07)*det;
+    o[6]=(a32*b02-a30*b05-a33*b01)*det; o[7]=(a20*b05-a22*b02+a23*b01)*det;
+    o[8]=(a10*b10-a11*b08+a13*b06)*det; o[9]=(a01*b08-a00*b10-a03*b06)*det;
+    o[10]=(a30*b04-a31*b02+a33*b00)*det; o[11]=(a21*b02-a20*b04-a23*b00)*det;
+    o[12]=(a11*b07-a10*b09-a12*b06)*det; o[13]=(a00*b09-a01*b07+a02*b06)*det;
+    o[14]=(a31*b01-a30*b03-a32*b00)*det; o[15]=(a20*b03-a21*b01+a22*b00)*det;
+    return o;
+  },
+  // Apply transform `t` around pivot point p: T(p) * t * T(-p) * m
+  aroundPivot(t, p, m) { return M4.mul(M4.mul(M4.trans(p[0], p[1], p[2]), M4.mul(t, M4.trans(-p[0], -p[1], -p[2]))), m); },
+};
+
+/* ============================================================
+   Worker: parsing, texture packing and depth sorting
+   (kept off the main thread so the headset never stutters)
+   ============================================================ */
+function workerMain() {
+  let positions = null, count = 0, sceneId = 0;
+
+  const fv = new Float32Array(1), iv = new Int32Array(fv.buffer);
+  function toHalf(v) {
+    fv[0] = v;
+    const f = iv[0];
+    const sign = (f >> 31) & 1, exp = (f >> 23) & 0xff;
+    let frac = f & 0x7fffff, e;
+    if (exp === 0) e = 0;
+    else if (exp < 113) { e = 0; frac |= 0x800000; frac >>= (113 - exp); if (frac & 0x1000000) { e = 1; frac = 0; } }
+    else if (exp < 142) e = exp - 112;
+    else { e = 31; frac = 0; }
+    return (sign << 15) | (e << 10) | (frac >> 13);
+  }
+  const packHalf = (a, b) => (toHalf(a) | (toHalf(b) << 16)) >>> 0;
+
+  const TYPES = {
+    float: [4, 'getFloat32'], float32: [4, 'getFloat32'], double: [8, 'getFloat64'], float64: [8, 'getFloat64'],
+    uchar: [1, 'getUint8'], uint8: [1, 'getUint8'], char: [1, 'getInt8'], int8: [1, 'getInt8'],
+    ushort: [2, 'getUint16'], uint16: [2, 'getUint16'], short: [2, 'getInt16'], int16: [2, 'getInt16'],
+    uint: [4, 'getUint32'], uint32: [4, 'getUint32'], int: [4, 'getInt32'], int32: [4, 'getInt32'],
+  };
+
+  // Unified representation: pos[3n], scl[3n] (linear), rgba[4n] (u8), rot[4n] (w,x,y,z normalized)
+  function parseSplat(buf) {
+    const n = Math.floor(buf.byteLength / 32);
+    if (n === 0) throw new Error('This file has no splats in it.');
+    const f = new Float32Array(buf, 0, n * 8), u = new Uint8Array(buf);
+    const pos = new Float32Array(3 * n), scl = new Float32Array(3 * n), rgba = new Uint8Array(4 * n), rot = new Float32Array(4 * n);
+    for (let i = 0; i < n; i++) {
+      pos[3*i] = f[8*i]; pos[3*i+1] = f[8*i+1]; pos[3*i+2] = f[8*i+2];
+      scl[3*i] = f[8*i+3]; scl[3*i+1] = f[8*i+4]; scl[3*i+2] = f[8*i+5];
+      rgba[4*i] = u[32*i+24]; rgba[4*i+1] = u[32*i+25]; rgba[4*i+2] = u[32*i+26]; rgba[4*i+3] = u[32*i+27];
+      let w = (u[32*i+28] - 128) / 128, x = (u[32*i+29] - 128) / 128, y = (u[32*i+30] - 128) / 128, z = (u[32*i+31] - 128) / 128;
+      const l = Math.hypot(w, x, y, z) || 1;
+      rot[4*i] = w / l; rot[4*i+1] = x / l; rot[4*i+2] = y / l; rot[4*i+3] = z / l;
+    }
+    return { n, pos, scl, rgba, rot };
+  }
+
+  function parsePly(buf) {
+    const u8 = new Uint8Array(buf);
+    const head = new TextDecoder().decode(u8.subarray(0, Math.min(u8.length, 65536)));
+    const endIdx = head.indexOf('end_header');
+    if (!head.startsWith('ply') || endIdx < 0) throw new Error('This .ply file has an unreadable header.');
+    let hdrEnd = endIdx + 10;
+    while (hdrEnd < u8.length && u8[hdrEnd] !== 10) hdrEnd++;
+    hdrEnd++;
+    let format = '', cur = null;
+    const elements = [];
+    for (const line of head.slice(0, endIdx).split(/\r?\n/)) {
+      const p = line.trim().split(/\s+/);
+      if (p[0] === 'format') format = p[1];
+      else if (p[0] === 'element') { cur = { name: p[1], count: parseInt(p[2], 10), props: {}, stride: 0 }; elements.push(cur); }
+      else if (p[0] === 'property' && cur) {
+        if (p[1] === 'list') throw new Error('PLY files with list properties (meshes) are not splats.');
+        const t = TYPES[p[1]];
+        if (!t) throw new Error('Unknown PLY property type: ' + p[1]);
+        cur.props[p[2]] = { offset: cur.stride, size: t[0], fn: t[1] };
+        cur.stride += t[0];
+      }
+    }
+    if (format !== 'binary_little_endian') throw new Error('Only binary little-endian .ply is supported (this one is ' + format + ').');
+    if (elements.some(e => e.name === 'chunk')) throw new Error('Compressed .ply (from SuperSplat) is not supported. Export as a standard .ply or .splat.');
+    let offset = hdrEnd, vert = null;
+    for (const e of elements) { if (e.name === 'vertex') { vert = e; break; } offset += e.count * e.stride; }
+    if (!vert) throw new Error('This .ply file has no vertex data.');
+    const n = vert.count, stride = vert.stride, P = vert.props;
+    if (offset + n * stride > buf.byteLength) throw new Error('This .ply file is incomplete — the download may have been cut short.');
+    const dv = new DataView(buf, offset);
+    const get = (name, i) => { const p = P[name]; return dv[p.fn](i * stride + p.offset, true); };
+    const has = (...names) => names.every(k => k in P);
+    const hasDC = has('f_dc_0', 'f_dc_1', 'f_dc_2'), hasRGB = has('red', 'green', 'blue');
+    const hasOp = has('opacity'), hasScale = has('scale_0', 'scale_1', 'scale_2'), hasRot = has('rot_0', 'rot_1', 'rot_2', 'rot_3');
+    if (!has('x', 'y', 'z')) throw new Error('This .ply file has no x/y/z positions.');
+    const SH_C0 = 0.28209479177387814;
+    const pos = new Float32Array(3 * n), scl = new Float32Array(3 * n), rgba = new Uint8Array(4 * n), rot = new Float32Array(4 * n);
+    const c255 = v => Math.max(0, Math.min(255, Math.round(v * 255)));
+    for (let i = 0; i < n; i++) {
+      pos[3*i] = get('x', i); pos[3*i+1] = get('y', i); pos[3*i+2] = get('z', i);
+      if (hasScale) { scl[3*i] = Math.exp(get('scale_0', i)); scl[3*i+1] = Math.exp(get('scale_1', i)); scl[3*i+2] = Math.exp(get('scale_2', i)); }
+      else { scl[3*i] = scl[3*i+1] = scl[3*i+2] = 0.01; }
+      if (hasDC) {
+        rgba[4*i] = c255(0.5 + SH_C0 * get('f_dc_0', i)); rgba[4*i+1] = c255(0.5 + SH_C0 * get('f_dc_1', i)); rgba[4*i+2] = c255(0.5 + SH_C0 * get('f_dc_2', i));
+      } else if (hasRGB) {
+        rgba[4*i] = get('red', i); rgba[4*i+1] = get('green', i); rgba[4*i+2] = get('blue', i);
+      } else { rgba[4*i] = rgba[4*i+1] = rgba[4*i+2] = 200; }
+      rgba[4*i+3] = hasOp ? c255(1 / (1 + Math.exp(-get('opacity', i)))) : 255;
+      if (hasRot) {
+        const w = get('rot_0', i), x = get('rot_1', i), y = get('rot_2', i), z = get('rot_3', i), l = Math.hypot(w, x, y, z) || 1;
+        rot[4*i] = w / l; rot[4*i+1] = x / l; rot[4*i+2] = y / l; rot[4*i+3] = z / l;
+      } else { rot[4*i] = 1; }
+    }
+    return { n, pos, scl, rgba, rot };
+  }
+
+  function quantile(arr, q) { const s = Float32Array.from(arr).sort(); return s[Math.min(s.length - 1, Math.max(0, Math.floor(q * s.length)))]; }
+
+  function build(d, cap) {
+    const n = d.n;
+    // Pick which splats to keep when over budget: drop the faintest, smallest ones first.
+    let keep = null, m = n;
+    if (cap > 0 && n > cap) {
+      const imp = new Float32Array(n);
+      for (let i = 0; i < n; i++) {
+        const a = d.scl[3*i], b = d.scl[3*i+1], c = d.scl[3*i+2];
+        imp[i] = (d.rgba[4*i+3] / 255) * (a*b + b*c + a*c);
+      }
+      const sampleN = Math.min(n, 50000), samp = new Float32Array(sampleN);
+      for (let k = 0; k < sampleN; k++) samp[k] = imp[Math.floor(k * n / sampleN)];
+      const thr = quantile(samp, 1 - cap / n);
+      keep = new Uint32Array(cap); m = 0;
+      for (let i = 0; i < n && m < cap; i++) if (imp[i] >= thr) keep[m++] = i;
+    }
+    // Robust centre (per-axis median) and size (80th percentile distance) from a sample
+    const sN = Math.min(m, 30000), sx = new Float32Array(sN), sy = new Float32Array(sN), sz = new Float32Array(sN);
+    for (let k = 0; k < sN; k++) {
+      const i = keep ? keep[Math.floor(k * m / sN)] : Math.floor(k * m / sN);
+      sx[k] = d.pos[3*i]; sy[k] = d.pos[3*i+1]; sz[k] = d.pos[3*i+2];
+    }
+    const center = [quantile(sx, 0.5), quantile(sy, 0.5), quantile(sz, 0.5)];
+    const dist = new Float32Array(sN);
+    for (let k = 0; k < sN; k++) dist[k] = Math.hypot(sx[k] - center[0], sy[k] - center[1], sz[k] - center[2]);
+    const radius = Math.max(1e-4, quantile(dist, 0.8));
+
+    const texW = 2048, texH = Math.max(1, Math.ceil(m / 1024));
+    const tex = new Uint32Array(texW * texH * 4), texF = new Float32Array(tex.buffer);
+    positions = new Float32Array(3 * m);
+    for (let j = 0; j < m; j++) {
+      const i = keep ? keep[j] : j;
+      const x = d.pos[3*i], y = d.pos[3*i+1], z = d.pos[3*i+2];
+      positions[3*j] = x; positions[3*j+1] = y; positions[3*j+2] = z;
+      texF[8*j] = x; texF[8*j+1] = y; texF[8*j+2] = z;
+      tex[8*j+3] = (d.rgba[4*i] | (d.rgba[4*i+1] << 8) | (d.rgba[4*i+2] << 16) | (d.rgba[4*i+3] << 24)) >>> 0;
+      const w = d.rot[4*i], qx = d.rot[4*i+1], qy = d.rot[4*i+2], qz = d.rot[4*i+3];
+      const s0 = d.scl[3*i], s1 = d.scl[3*i+1], s2 = d.scl[3*i+2];
+      // M rows = scale_k * (column k of rotation matrix R); Sigma = M^T M = R S^2 R^T
+      const M0 = (1 - 2*(qy*qy + qz*qz)) * s0, M1 = 2*(qx*qy + w*qz) * s0, M2 = 2*(qx*qz - w*qy) * s0;
+      const M3 = 2*(qx*qy - w*qz) * s1, M4_ = (1 - 2*(qx*qx + qz*qz)) * s1, M5 = 2*(qy*qz + w*qx) * s1;
+      const M6 = 2*(qx*qz + w*qy) * s2, M7 = 2*(qy*qz - w*qx) * s2, M8 = (1 - 2*(qx*qx + qy*qy)) * s2;
+      const k = 4; // stored x4 to keep small values out of half-float underflow; shader multiplies by 0.25
+      tex[8*j+4] = packHalf(k*(M0*M0 + M3*M3 + M6*M6), k*(M0*M1 + M3*M4_ + M6*M7));
+      tex[8*j+5] = packHalf(k*(M0*M2 + M3*M5 + M6*M8), k*(M1*M1 + M4_*M4_ + M7*M7));
+      tex[8*j+6] = packHalf(k*(M1*M2 + M4_*M5 + M7*M8), k*(M2*M2 + M5*M5 + M8*M8));
+    }
+    count = m;
+    return { tex, texW, texH, count: m, total: n, center, radius };
+  }
+
+  let depthKeys = null, counts = null;
+  function sort(mv) {
+    const n = count;
+    if (!depthKeys || depthKeys.length < n) depthKeys = new Int32Array(n);
+    const z = new Float32Array(n);
+    let mn = Infinity, mx = -Infinity;
+    const a = mv[0], b = mv[1], c = mv[2], d = mv[3];
+    for (let i = 0; i < n; i++) {
+      const v = a * positions[3*i] + b * positions[3*i+1] + c * positions[3*i+2] + d;
+      z[i] = v; if (v < mn) mn = v; if (v > mx) mx = v;
+    }
+    const BUCKETS = 65536, scale = (BUCKETS - 1) / ((mx - mn) || 1);
+    if (!counts) counts = new Uint32Array(BUCKETS); else counts.fill(0);
+    for (let i = 0; i < n; i++) { const k = ((z[i] - mn) * scale) | 0; depthKeys[i] = k; counts[k]++; }
+    // ascending view-space z: most negative (farthest) first → back-to-front drawing
+    let sum = 0;
+    for (let k = 0; k < BUCKETS; k++) { const c2 = counts[k]; counts[k] = sum; sum += c2; }
+    const out = new Uint32Array(n);
+    for (let i = 0; i < n; i++) out[counts[depthKeys[i]]++] = i;
+    return out;
+  }
+
+  self.onmessage = (e) => {
+    const msg = e.data;
+    if (msg.type === 'load') {
+      try {
+        sceneId = msg.sceneId; positions = null; count = 0;
+        const d = msg.format === 'ply' ? parsePly(msg.buffer) : parseSplat(msg.buffer);
+        const r = build(d, msg.cap);
+        self.postMessage({ type: 'loaded', sceneId, ...r }, [r.tex.buffer]);
+      } catch (err) {
+        self.postMessage({ type: 'error', sceneId: msg.sceneId, message: err.message || String(err) });
+      }
+    } else if (msg.type === 'sort') {
+      if (msg.sceneId !== sceneId || !positions) { self.postMessage({ type: 'sorted', sceneId: msg.sceneId, stale: true }); return; }
+      const idx = sort(msg.mv);
+      self.postMessage({ type: 'sorted', sceneId, idx }, [idx.buffer]);
+    }
+  };
+}
+
+/* ============================================================
+   WebGL setup
+   ============================================================ */
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl2', { antialias: false, alpha: false, xrCompatible: true, powerPreference: 'high-performance' });
+const ui = {
+  panel: document.getElementById('panel'), toggle: document.getElementById('toggleBtn'),
+  vr: document.getElementById('vrBtn'), presets: document.getElementById('presets'),
+  url: document.getElementById('urlInput'), urlBtn: document.getElementById('urlBtn'), file: document.getElementById('fileInput'),
+  status: document.getElementById('status'), bar: document.getElementById('bar'),
+  flip: document.getElementById('flipChk'), spin: document.getElementById('spinChk'), grid: document.getElementById('gridChk'), cap: document.getElementById('capSel'),
+};
+
+function setStatus(text, isError = false) { ui.status.textContent = text; ui.status.classList.toggle('error', isError); }
+function setProgress(p) {
+  ui.bar.style.visibility = p == null ? 'hidden' : 'visible';
+  ui.bar.firstElementChild.style.width = p == null ? '0' : Math.round(Math.min(1, p) * 100) + '%';
+}
+
+if (!gl) {
+  setStatus('This browser does not support WebGL 2, which the viewer needs.', true);
+  throw new Error('WebGL2 unavailable');
+}
+
+function compile(vs, fs) {
+  const p = gl.createProgram();
+  for (const [type, src] of [[gl.VERTEX_SHADER, vs], [gl.FRAGMENT_SHADER, fs]]) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    gl.attachShader(p, s);
+  }
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+
+const SPLAT_VS = `#version 300 es
+precision highp float;
+precision highp int;
+uniform highp usampler2D u_tex;
+uniform mat4 u_proj, u_mv;
+uniform vec2 u_focal, u_viewport;
+in vec2 a_pos;
+in uint a_index;
+out vec4 v_color;
+out vec2 v_pos;
+void cull() { gl_Position = vec4(0.0, 0.0, 2.0, 1.0); }
+void main() {
+  ivec2 tc = ivec2(int((a_index & 1023u) << 1), int(a_index >> 10));
+  uvec4 c0 = texelFetch(u_tex, tc, 0);
+  vec4 cam = u_mv * vec4(uintBitsToFloat(c0.xyz), 1.0);
+  vec4 clip = u_proj * cam;
+  float lim = 1.2 * clip.w;
+  if (cam.z > -0.01 || clip.x < -lim || clip.x > lim || clip.y < -lim || clip.y > lim) { cull(); return; }
+  uvec4 c1 = texelFetch(u_tex, tc + ivec2(1, 0), 0);
+  vec2 u1 = unpackHalf2x16(c1.x), u2 = unpackHalf2x16(c1.y), u3 = unpackHalf2x16(c1.z);
+  mat3 V = mat3(u1.x, u1.y, u2.x,  u1.y, u2.y, u3.x,  u2.x, u3.x, u3.y) * 0.25;
+  mat3 W = mat3(u_mv);
+  mat3 S = W * V * transpose(W);
+  float iz = 1.0 / cam.z;
+  vec3 j1 = vec3(-u_focal.x * iz, 0.0, u_focal.x * cam.x * iz * iz);
+  vec3 j2 = vec3(0.0, -u_focal.y * iz, u_focal.y * cam.y * iz * iz);
+  float a = dot(j1, S * j1) + 0.3;
+  float b = dot(j1, S * j2);
+  float c = dot(j2, S * j2) + 0.3;
+  float mid = 0.5 * (a + c);
+  float rad = length(vec2(0.5 * (a - c), b));
+  float l1 = mid + rad, l2 = mid - rad;
+  if (l2 <= 0.0) { cull(); return; }
+  vec2 dir = abs(b) < 1e-9 ? (a >= c ? vec2(1.0, 0.0) : vec2(0.0, 1.0)) : normalize(vec2(b, l1 - a));
+  vec2 major = min(3.0 * sqrt(l1), 2048.0) * dir;
+  vec2 minor = min(3.0 * sqrt(l2), 2048.0) * vec2(dir.y, -dir.x);
+  vec2 ndc = clip.xy / clip.w;
+  vec2 off = (a_pos.x * major + a_pos.y * minor) * 2.0 / u_viewport;
+  gl_Position = vec4(ndc + off, clip.z / clip.w, 1.0);
+  uint col = c0.w;
+  v_color = vec4(float(col & 255u), float((col >> 8) & 255u), float((col >> 16) & 255u), float(col >> 24)) / 255.0;
+  v_pos = a_pos;
+}`;
+const SPLAT_FS = `#version 300 es
+precision highp float;
+in vec4 v_color;
+in vec2 v_pos;
+out vec4 o;
+void main() {
+  float r = dot(v_pos, v_pos);
+  if (r > 1.0) discard;
+  float alpha = v_color.a * exp(-4.5 * r);
+  if (alpha < 1.0 / 255.0) discard;
+  o = vec4(v_color.rgb * alpha, alpha);
+}`;
+const LINE_VS = `#version 300 es
+uniform mat4 u_mvp;
+in vec3 a_p;
+void main() { gl_Position = u_mvp * vec4(a_p, 1.0); }`;
+const LINE_FS = `#version 300 es
+precision mediump float;
+uniform vec4 u_color;
+out vec4 o;
+void main() { o = u_color; }`;
+
+const splatProg = compile(SPLAT_VS, SPLAT_FS);
+const lineProg = compile(LINE_VS, LINE_FS);
+const U = {};
+for (const n of ['u_tex', 'u_proj', 'u_mv', 'u_focal', 'u_viewport']) U[n] = gl.getUniformLocation(splatProg, n);
+const UL = { mvp: gl.getUniformLocation(lineProg, 'u_mvp'), color: gl.getUniformLocation(lineProg, 'u_color') };
+
+// Splat VAO: a static quad plus a per-instance sorted index
+const splatVAO = gl.createVertexArray();
+gl.bindVertexArray(splatVAO);
+const quadBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+const locPos = gl.getAttribLocation(splatProg, 'a_pos');
+gl.enableVertexAttribArray(locPos);
+gl.vertexAttribPointer(locPos, 2, gl.FLOAT, false, 0, 0);
+const indexBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, indexBuf);
+const locIdx = gl.getAttribLocation(splatProg, 'a_index');
+gl.enableVertexAttribArray(locIdx);
+gl.vertexAttribIPointer(locIdx, 1, gl.UNSIGNED_INT, 0, 0);
+gl.vertexAttribDivisor(locIdx, 1);
+gl.bindVertexArray(null);
+
+const splatTex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, splatTex);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+// Line geometry: floor grid and controller markers
+function makeLines(pts) {
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const b = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, b);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(pts), gl.STATIC_DRAW);
+  const loc = gl.getAttribLocation(lineProg, 'a_p');
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 3, gl.FLOAT, false, 0, 0);
+  gl.bindVertexArray(null);
+  return { vao, n: pts.length / 3 };
+}
+const gridPts = [];
+for (let i = -10; i <= 10; i++) { const v = i * 0.5; gridPts.push(-5, 0, v, 5, 0, v, v, 0, -5, v, 0, 5); }
+const gridLines = makeLines(gridPts);
+const ctrlLines = makeLines([0, 0, 0, 0, 0, -0.12, -0.025, 0, 0, 0.025, 0, 0, 0, -0.025, 0, 0, 0.025, 0]);
+
+/* ============================================================
+   Scene state
+   ============================================================ */
+const worker = new Worker(URL.createObjectURL(new Blob(['(' + workerMain.toString() + ')()'], { type: 'text/javascript' })));
+const scene = { id: 0, count: 0, center: [0, 0, 0], radius: 1, ready: false };
+let sortBusy = false, lastSortKey = null, pendingSortKey = null;
+let lastSource = null, presetIndex = -1;
+
+const cam = { yaw: 0, pitch: 0.15, dist: 2.8, target: [0, 0, 0] };
+let spinAngle = 0;
+let vrModel = M4.ident();
+
+function baseMatrix() {
+  const s = 1 / scene.radius;
+  const flip = ui.flip.checked ? M4.rotX(Math.PI) : M4.ident();
+  return M4.mul(M4.scale(s, s, s), M4.mul(flip, M4.trans(-scene.center[0], -scene.center[1], -scene.center[2])));
+}
+function resetCamera() { cam.yaw = 0; cam.pitch = 0.15; cam.dist = 2.8; cam.target = [0, 0, 0]; spinAngle = 0; }
+
+worker.onmessage = (e) => {
+  const m = e.data;
+  if (m.type === 'loaded') {
+    if (m.sceneId !== scene.id) return;
+    gl.bindTexture(gl.TEXTURE_2D, splatTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32UI, m.texW, m.texH, 0, gl.RGBA_INTEGER, gl.UNSIGNED_INT, m.tex);
+    const ident = new Uint32Array(m.count);
+    for (let i = 0; i < m.count; i++) ident[i] = i;
+    gl.bindBuffer(gl.ARRAY_BUFFER, indexBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, ident, gl.DYNAMIC_DRAW);
+    Object.assign(scene, { count: m.count, center: m.center, radius: m.radius, ready: true });
+    sortBusy = false; lastSortKey = null;
+    if (!xrSession) resetCamera();
+    setProgress(null);
+    const fmt = n => n.toLocaleString();
+    setStatus(m.count < m.total
+      ? `Showing ${fmt(m.count)} of ${fmt(m.total)} splats (budget limit).`
+      : `Loaded ${fmt(m.count)} splats.`);
+  } else if (m.type === 'error') {
+    if (m.sceneId !== scene.id) return;
+    setProgress(null); setStatus(m.message, true);
+  } else if (m.type === 'sorted') {
+    sortBusy = false;
+    if (m.stale || m.sceneId !== scene.id || !m.idx) return;
+    gl.bindBuffer(gl.ARRAY_BUFFER, indexBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, m.idx, gl.DYNAMIC_DRAW);
+    lastSortKey = pendingSortKey;
+  }
+};
+
+// Sort key: the row of model-view that gives view-space depth for a point
+function requestSort(mv) {
+  if (!scene.ready || sortBusy) return;
+  const key = [mv[2], mv[6], mv[10], mv[14]];
+  if (lastSortKey) {
+    let d = 0;
+    for (let i = 0; i < 3; i++) d += Math.abs(key[i] - lastSortKey[i]);
+    d += Math.abs(key[3] - lastSortKey[3]) * 0.1;
+    if (d < 0.002) return;
+  }
+  sortBusy = true; pendingSortKey = key;
+  worker.postMessage({ type: 'sort', sceneId: scene.id, mv: key });
+}
+
+/* ============================================================
+   Loading
+   ============================================================ */
+function detectFormat(name, buf) {
+  const head = new Uint8Array(buf, 0, Math.min(4, buf.byteLength));
+  if (head[0] === 0x70 && head[1] === 0x6c && head[2] === 0x79) return 'ply'; // "ply"
+  if (/\.ply(\?|#|$)/i.test(name)) return 'ply';
+  return 'splat';
+}
+
+function startScene(buf, name) {
+  scene.id++; scene.ready = false; scene.count = 0;
+  setStatus('Preparing ' + name + '…'); setProgress(1);
+  const fmt = detectFormat(name, buf);
+  if (/\.(ksplat|spz|sog|compressed\.ply)(\?|#|$)/i.test(name)) {
+    setProgress(null); setStatus('This viewer reads .splat and standard .ply files. Convert this file with SuperSplat first.', true); return;
+  }
+  worker.postMessage({ type: 'load', sceneId: scene.id, buffer: buf, format: fmt, cap: +ui.cap.value }, [buf]);
+}
+
+let loadToken = 0;
+async function loadUrl(url, name) {
+  const token = ++loadToken;
+  lastSource = { kind: 'url', url, name };
+  setStatus('Downloading ' + name + '…'); setProgress(0);
+  try {
+    const res = await fetch(url, { mode: 'cors' });
+    if (!res.ok) throw new Error(`The server answered ${res.status}. Check the link.`);
+    const total = +res.headers.get('content-length') || 0;
+    let buf;
+    if (res.body && res.body.getReader) {
+      const reader = res.body.getReader(), chunks = [];
+      let got = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (token !== loadToken) { reader.cancel(); return; }
+        chunks.push(value); got += value.length;
+        if (total) setProgress(got / total);
+        setStatus(`Downloading ${name}… ${(got / 1048576).toFixed(1)} MB`);
+      }
+      const all = new Uint8Array(got);
+      let o = 0;
+      for (const c of chunks) { all.set(c, o); o += c.length; }
+      buf = all.buffer;
+    } else buf = await res.arrayBuffer();
+    if (token !== loadToken) return;
+    startScene(buf, name);
+  } catch (err) {
+    if (token !== loadToken) return;
+    setProgress(null);
+    const msg = err instanceof TypeError
+      ? 'Could not download that link. The host may block cross-origin downloads, or the address is wrong.'
+      : err.message;
+    setStatus(msg, true);
+  }
+}
+
+async function loadFile(file) {
+  ++loadToken;
+  lastSource = { kind: 'file', file };
+  presetIndex = -1; markPreset();
+  setStatus('Reading ' + file.name + '…'); setProgress(0.5);
+  try { startScene(await file.arrayBuffer(), file.name); }
+  catch (err) { setProgress(null); setStatus('Could not read that file: ' + err.message, true); }
+}
+
+function reloadLast() {
+  if (!lastSource) return;
+  if (lastSource.kind === 'url') loadUrl(lastSource.url, lastSource.name); else loadFile(lastSource.file);
+}
+
+function markPreset() {
+  [...ui.presets.children].forEach((b, i) => b.classList.toggle('active', i === presetIndex));
+}
+function loadPreset(i) {
+  presetIndex = (i + PRESETS.length) % PRESETS.length;
+  const p = PRESETS[presetIndex];
+  ui.flip.checked = p.flip;
+  markPreset();
+  loadUrl(p.url, p.name);
+}
+
+PRESETS.forEach((p, i) => {
+  const b = document.createElement('button');
+  b.textContent = p.name;
+  b.addEventListener('click', () => loadPreset(i));
+  ui.presets.appendChild(b);
+});
+
+function loadTypedUrl() {
+  let u = ui.url.value.trim();
+  if (!u) { setStatus('Paste a link to a .splat or .ply file first.', true); return; }
+  if (!/^https?:\/\//i.test(u)) u = 'https://' + u;
+  // Convert common share-page links into direct downloads
+  u = u.replace(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/blob\//, 'https://raw.githubusercontent.com/$1/$2/')
+       .replace(/(huggingface\.co\/.+)\/blob\//, '$1/resolve/');
+  presetIndex = -1; markPreset();
+  const name = decodeURIComponent(u.split('?')[0].split('/').pop() || 'splat');
+  loadUrl(u, name);
+  const q = new URL(location.href); q.searchParams.set('url', u);
+  history.replaceState(null, '', q);
+}
+ui.urlBtn.addEventListener('click', loadTypedUrl);
+ui.url.addEventListener('keydown', e => { if (e.key === 'Enter') loadTypedUrl(); });
+ui.file.addEventListener('change', () => { if (ui.file.files[0]) loadFile(ui.file.files[0]); ui.file.value = ''; });
+ui.cap.addEventListener('change', reloadLast);
+ui.toggle.addEventListener('click', () => {
+  const c = ui.panel.classList.toggle('collapsed');
+  ui.toggle.textContent = c ? 'Show' : 'Hide';
+  ui.toggle.setAttribute('aria-expanded', String(!c));
+});
+
+// Drag and drop
+let dragDepth = 0;
+addEventListener('dragenter', e => { e.preventDefault(); dragDepth++; document.body.classList.add('dragging'); });
+addEventListener('dragleave', () => { if (--dragDepth <= 0) { dragDepth = 0; document.body.classList.remove('dragging'); } });
+addEventListener('dragover', e => e.preventDefault());
+addEventListener('drop', e => {
+  e.preventDefault(); dragDepth = 0; document.body.classList.remove('dragging');
+  const f = e.dataTransfer.files[0];
+  if (f) loadFile(f);
+});
+
+/* ============================================================
+   Desktop / 2D controls (also works with the Quest browser pointer)
+   ============================================================ */
+const pointers = new Map();
+let pinch = null;
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+canvas.addEventListener('pointerdown', e => {
+  canvas.setPointerCapture(e.pointerId);
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, pan: e.button === 2 || e.button === 1 || e.shiftKey });
+  if (pointers.size === 2) pinch = null;
+});
+function panBy(dx, dy) {
+  const R = M4.mul(M4.rotX(cam.pitch), M4.rotY(cam.yaw));
+  const s = cam.dist * 0.0015;
+  for (let i = 0; i < 3; i++) cam.target[i] += -R[i * 4] * dx * s + R[i * 4 + 1] * dy * s;
+}
+canvas.addEventListener('pointermove', e => {
+  const p = pointers.get(e.pointerId);
+  if (!p) return;
+  const dx = e.clientX - p.x, dy = e.clientY - p.y;
+  p.x = e.clientX; p.y = e.clientY;
+  if (pointers.size === 1) {
+    if (p.pan || e.shiftKey) panBy(dx, dy);
+    else { cam.yaw += dx * 0.006; cam.pitch = Math.max(-1.5, Math.min(1.5, cam.pitch + dy * 0.006)); }
+  } else if (pointers.size === 2) {
+    const [a, b] = [...pointers.values()];
+    const d = Math.hypot(a.x - b.x, a.y - b.y), mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+    if (pinch) { cam.dist = Math.max(0.05, Math.min(60, cam.dist * pinch.d / d)); panBy(mx - pinch.mx, my - pinch.my); }
+    pinch = { d, mx, my };
+  }
+});
+const endPointer = e => { pointers.delete(e.pointerId); pinch = null; };
+canvas.addEventListener('pointerup', endPointer);
+canvas.addEventListener('pointercancel', endPointer);
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  cam.dist = Math.max(0.05, Math.min(60, cam.dist * Math.exp(e.deltaY * 0.0012)));
+}, { passive: false });
+addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+  if (e.key === 'r' || e.key === 'R') resetCamera();
+  else if (e.key === 'f' || e.key === 'F') { ui.flip.checked = !ui.flip.checked; }
+  else if (e.key === ' ') { e.preventDefault(); ui.spin.checked = !ui.spin.checked; }
+  else if (e.key === 'ArrowLeft') cam.yaw -= 0.1;
+  else if (e.key === 'ArrowRight') cam.yaw += 0.1;
+  else if (e.key === 'ArrowUp') cam.pitch = Math.max(-1.5, cam.pitch - 0.1);
+  else if (e.key === 'ArrowDown') cam.pitch = Math.min(1.5, cam.pitch + 0.1);
+});
+
+/* ============================================================
+   Drawing
+   ============================================================ */
+const BG = [0.11, 0.13, 0.19];
+
+function drawSplats(proj, mv, vw, vh) {
+  if (!scene.ready || !scene.count) return;
+  gl.useProgram(splatProg);
+  gl.uniformMatrix4fv(U.u_proj, false, proj);
+  gl.uniformMatrix4fv(U.u_mv, false, mv);
+  gl.uniform2f(U.u_focal, proj[0] * vw / 2, proj[5] * vh / 2);
+  gl.uniform2f(U.u_viewport, vw, vh);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, splatTex);
+  gl.uniform1i(U.u_tex, 0);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+  gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL); gl.depthMask(false);
+  gl.bindVertexArray(splatVAO);
+  gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, scene.count);
+  gl.bindVertexArray(null);
+  gl.depthMask(true); gl.disable(gl.BLEND);
+}
+
+function drawLines(lines, mvp, color) {
+  gl.useProgram(lineProg);
+  gl.uniformMatrix4fv(UL.mvp, false, mvp);
+  gl.uniform4fv(UL.color, color);
+  gl.enable(gl.DEPTH_TEST); gl.depthMask(true);
+  gl.bindVertexArray(lines.vao);
+  gl.drawArrays(gl.LINES, 0, lines.n);
+  gl.bindVertexArray(null);
+}
+
+let lastT = performance.now();
+function desktopFrame(t) {
+  requestAnimationFrame(desktopFrame);
+  if (xrSession) return;
+  const dt = Math.min(0.1, (t - lastT) / 1000); lastT = t;
+  if (ui.spin.checked) spinAngle += dt * 0.35;
+  const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+  const w = Math.round(canvas.clientWidth * dpr), h = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, w, h);
+  gl.clearColor(BG[0], BG[1], BG[2], 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  if (!scene.ready) return;
+  const proj = M4.persp(Math.PI / 3, w / h, 0.01, 500);
+  const view = M4.mul(M4.trans(0, 0, -cam.dist), M4.mul(M4.mul(M4.rotX(cam.pitch), M4.rotY(cam.yaw)),
+    M4.trans(-cam.target[0], -cam.target[1], -cam.target[2])));
+  const model = M4.mul(M4.rotY(spinAngle), baseMatrix());
+  const mv = M4.mul(view, model);
+  requestSort(mv);
+  drawSplats(proj, mv, w, h);
+}
+requestAnimationFrame(desktopFrame);
+
+/* ============================================================
+   WebXR (Quest)
+   ============================================================ */
+let xrSession = null, xrRef = null, floorSpace = true, xrLastT = 0;
+const ctrl = { left: null, right: null };
+const prevButtons = { left: [], right: [] };
+let grab = null;
+
+function resetVRPlacement() {
+  // Put the splat at table height, a little in front of you, about 1 m across
+  const y = floorSpace ? 1.1 : -0.1;
+  vrModel = M4.mul(M4.trans(0, y, -1.2), M4.scale(0.5, 0.5, 0.5));
+}
+function modelCenter() { return [vrModel[12], vrModel[13], vrModel[14]]; }
+
+async function setupVRButton() {
+  if (!navigator.xr) {
+    ui.vr.textContent = window.isSecureContext ? 'VR not available in this browser' : 'VR needs an https:// address';
+    return;
+  }
+  let ok = false;
+  try { ok = await navigator.xr.isSessionSupported('immersive-vr'); } catch (_) {}
+  if (!ok) { ui.vr.textContent = 'No VR headset found'; return; }
+  ui.vr.disabled = false;
+  ui.vr.textContent = 'Enter VR';
+  ui.vr.addEventListener('click', () => { if (xrSession) xrSession.end(); else enterVR(); });
+}
+
+async function enterVR() {
+  try {
+    const session = await navigator.xr.requestSession('immersive-vr', { optionalFeatures: ['local-floor'] });
+    await gl.makeXRCompatible();
+    const layer = new XRWebGLLayer(session, gl, { antialias: false, depth: true, framebufferScaleFactor: 1.0 });
+    if ('fixedFoveation' in layer) layer.fixedFoveation = 1;
+    session.updateRenderState({ baseLayer: layer, depthNear: 0.02, depthFar: 500 });
+    try { xrRef = await session.requestReferenceSpace('local-floor'); floorSpace = true; }
+    catch (_) { xrRef = await session.requestReferenceSpace('local'); floorSpace = false; }
+    xrSession = session;
+    resetVRPlacement();
+    lastSortKey = null; grab = null;
+    ui.vr.textContent = 'Exit VR';
+    session.addEventListener('end', () => {
+      xrSession = null; grab = null; lastSortKey = null;
+      ui.vr.textContent = 'Enter VR';
+    });
+    xrLastT = 0;
+    session.requestAnimationFrame(xrFrame);
+  } catch (err) {
+    setStatus('Could not start VR: ' + err.message, true);
+  }
+}
+
+function handleXRInput(frame, pose, dt) {
+  ctrl.left = ctrl.right = null;
+  const holding = [];
+  for (const src of frame.session.inputSources) {
+    if (!src.gamepad || !src.gripSpace || (src.handedness !== 'left' && src.handedness !== 'right')) continue;
+    const gp = frame.getPose(src.gripSpace, xrRef);
+    if (!gp) continue;
+    const h = src.handedness, m = gp.transform.matrix, b = src.gamepad.buttons, ax = src.gamepad.axes;
+    ctrl[h] = { m: Float32Array.from(m), grabbing: false };
+    const isDown = i => !!(b[i] && b[i].pressed);
+    const pressed = i => isDown(i) && !prevButtons[h][i];
+    if (isDown(0) || isDown(1)) { holding.push(h); ctrl[h].grabbing = true; }
+
+    let sx = ax.length >= 4 ? ax[2] : (ax[0] || 0), sy = ax.length >= 4 ? ax[3] : (ax[1] || 0);
+    if (Math.abs(sx) < 0.15) sx = 0;
+    if (Math.abs(sy) < 0.15) sy = 0;
+
+    if (h === 'right') {
+      if (pressed(4)) loadPreset(presetIndex + 1);
+      if (pressed(5)) resetVRPlacement();
+      if (sx) vrModel = M4.aroundPivot(M4.rotY(-sx * dt * 1.8), modelCenter(), vrModel);
+      if (sy) { const f = Math.exp(-sy * dt * 1.2); vrModel = M4.aroundPivot(M4.scale(f, f, f), modelCenter(), vrModel); }
+    } else {
+      if (pressed(4)) ui.flip.checked = !ui.flip.checked;
+      if (pressed(5)) ui.spin.checked = !ui.spin.checked;
+      if (sx || sy) {
+        // Walk relative to where you're looking (horizontal only): moving you forward = moving the scene back
+        const hm = pose.transform.matrix;
+        let fx = -hm[8], fz = -hm[10]; const fl = Math.hypot(fx, fz) || 1; fx /= fl; fz /= fl;
+        const rx = -fz, rz = fx;
+        const speed = 1.4 * dt;
+        const mx = (rx * sx + fx * -sy) * speed, mz = (rz * sx + fz * -sy) * speed;
+        vrModel = M4.mul(M4.trans(-mx, 0, -mz), vrModel);
+      }
+    }
+    prevButtons[h] = b.map(x => x.pressed);
+  }
+
+  // Grabbing
+  const key = holding.slice().sort().join(',');
+  if (!key) { grab = null; return; }
+  if (!grab || grab.key !== key) {
+    grab = { key, model: vrModel };
+    if (holding.length === 1) grab.inv = M4.invert(ctrl[holding[0]].m);
+    else {
+      const a = ctrl.left.m, b = ctrl.right.m;
+      grab.mid = [(a[12] + b[12]) / 2, (a[13] + b[13]) / 2, (a[14] + b[14]) / 2];
+      grab.d = Math.hypot(a[12] - b[12], a[13] - b[13], a[14] - b[14]) || 0.01;
+      grab.ang = Math.atan2(b[14] - a[14], b[12] - a[12]);
+    }
+  }
+  if (holding.length === 1) {
+    vrModel = M4.mul(M4.mul(ctrl[holding[0]].m, grab.inv), grab.model);
+  } else {
+    const a = ctrl.left.m, b = ctrl.right.m;
+    const mid = [(a[12] + b[12]) / 2, (a[13] + b[13]) / 2, (a[14] + b[14]) / 2];
+    const d = Math.hypot(a[12] - b[12], a[13] - b[13], a[14] - b[14]) || 0.01;
+    const ang = Math.atan2(b[14] - a[14], b[12] - a[12]);
+    const s = Math.max(0.02, Math.min(50, d / grab.d));
+    const t = M4.mul(M4.trans(mid[0], mid[1], mid[2]),
+      M4.mul(M4.rotY(-(ang - grab.ang)), M4.mul(M4.scale(s, s, s), M4.trans(-grab.mid[0], -grab.mid[1], -grab.mid[2]))));
+    vrModel = M4.mul(t, grab.model);
+  }
+}
+
+function xrFrame(t, frame) {
+  const session = frame.session;
+  session.requestAnimationFrame(xrFrame);
+  const pose = frame.getViewerPose(xrRef);
+  if (!pose) return;
+  const dt = xrLastT ? Math.min(0.1, (t - xrLastT) / 1000) : 0;
+  xrLastT = t;
+
+  handleXRInput(frame, pose, dt);
+  if (ui.spin.checked && !grab) vrModel = M4.aroundPivot(M4.rotY(dt * 0.35), modelCenter(), vrModel);
+
+  const layer = session.renderState.baseLayer;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
+  gl.clearColor(BG[0], BG[1], BG[2], 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  const model = M4.mul(vrModel, baseMatrix());
+  for (const view of pose.views) {
+    const vp = layer.getViewport(view);
+    gl.viewport(vp.x, vp.y, vp.width, vp.height);
+    const viewM = view.transform.inverse.matrix, proj = view.projectionMatrix;
+    const vpM = M4.mul(proj, viewM);
+    if (ui.grid.checked && floorSpace) drawLines(gridLines, vpM, [0.42, 0.47, 0.62, 1]);
+    for (const h of ['left', 'right']) {
+      const c = ctrl[h];
+      if (c) drawLines(ctrlLines, M4.mul(vpM, c.m), c.grabbing ? [0.62, 0.69, 1, 1] : [0.93, 0.94, 0.98, 1]);
+    }
+    drawSplats(proj, M4.mul(viewM, model), vp.width, vp.height);
+  }
+  requestSort(M4.mul(pose.views[0].transform.inverse.matrix, model));
+}
+
+/* ============================================================
+   Start
+   ============================================================ */
+const isQuest = /OculusBrowser|Quest/i.test(navigator.userAgent);
+ui.cap.value = isQuest ? '500000' : '2000000';
+setupVRButton();
+
+const params = new URLSearchParams(location.search);
+if (params.get('flip') === '0') ui.flip.checked = false;
+if (params.get('url')) {
+  ui.url.value = params.get('url');
+  const u = params.get('url');
+  const keepFlip = ui.flip.checked;
+  loadUrl(u, decodeURIComponent(u.split('?')[0].split('/').pop() || 'splat'));
+  ui.flip.checked = keepFlip;
+} else {
+  loadPreset(0);
+}
+</script>
+</body>
+</html>
